@@ -1,13 +1,20 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::io::{self, Read};
+use std::path::PathBuf;
+
+const DEFAULT_URL: &str = "http://localhost:8000";
 
 #[derive(Parser, Debug)]
 #[command(name = "ask", about = "CLI tool for querying a local vLLM instance")]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+
     /// Base URL of the vLLM server
-    #[arg(short, long, default_value = "http://localhost:8000")]
-    pub url: String,
+    #[arg(short, long)]
+    pub url: Option<String>,
 
     /// Model name (fetched from server if not provided)
     #[arg(short, long)]
@@ -19,6 +26,52 @@ pub struct Cli {
 
     /// The prompt text. If omitted, reads from stdin.
     pub text: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Set the default server URL
+    SetUrl {
+        /// The URL to save as the default
+        url: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct Config {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+pub fn config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config"))
+        .join("ask")
+        .join("config.json")
+}
+
+pub fn load_config_from(path: &PathBuf) -> Config {
+    match fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+        Err(_) => Config::default(),
+    }
+}
+
+pub fn save_config_to(path: &PathBuf, config: &Config) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create config directory: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("Failed to serialise config: {e}"))?;
+    fs::write(path, json).map_err(|e| format!("Failed to write config: {e}"))?;
+    Ok(())
+}
+
+pub fn resolve_url(cli_url: Option<String>, config: &Config) -> String {
+    cli_url
+        .or_else(|| config.url.clone())
+        .unwrap_or_else(|| DEFAULT_URL.to_string())
 }
 
 #[derive(Serialize)]
@@ -83,14 +136,34 @@ pub fn resolve_text(text: Option<String>) -> Result<String, String> {
 
 pub async fn fetch_model(client: &reqwest::Client, base_url: &str) -> Result<String, String> {
     let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
-    let resp: ModelsResponse = client
+    let response = client
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch models: {e}"))?
-        .json()
+        .map_err(|e| format!("Failed to connect to {base_url}: {e}"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
         .await
-        .map_err(|e| format!("Failed to parse models response: {e}"))?;
+        .map_err(|e| format!("Failed to read response from {url}: {e}"))?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "Server at {base_url} returned {status}. Is this a vLLM-compatible server?\nResponse: {body}"
+        ));
+    }
+
+    let resp: ModelsResponse = serde_json::from_str(&body).map_err(|_| {
+        let preview = if body.len() > 200 {
+            format!("{}...", &body[..200])
+        } else {
+            body.clone()
+        };
+        format!(
+            "Server at {base_url} didn't return a valid models response. Is this a vLLM-compatible server?\nGot: {preview}"
+        )
+    })?;
 
     resp.data
         .first()
@@ -123,6 +196,26 @@ pub async fn send_chat(
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let cfg_path = config_path();
+
+    if let Some(Commands::SetUrl { url }) = cli.command {
+        let config = Config {
+            url: Some(url.clone()),
+        };
+        match save_config_to(&cfg_path, &config) {
+            Ok(_) => {
+                println!("Default URL set to: {url}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let config = load_config_from(&cfg_path);
+    let url = resolve_url(cli.url, &config);
 
     let content = match resolve_text(cli.text) {
         Ok(t) => t,
@@ -136,7 +229,7 @@ async fn main() {
 
     let model = match cli.model {
         Some(m) => m,
-        None => match fetch_model(&client, &cli.url).await {
+        None => match fetch_model(&client, &url).await {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -153,7 +246,7 @@ async fn main() {
         }],
     };
 
-    match send_chat(&client, &cli.url, &request).await {
+    match send_chat(&client, &url, &request).await {
         Ok(reply) => println!("{reply}"),
         Err(e) => {
             eprintln!("Error: {e}");
@@ -165,6 +258,12 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn temp_config_path() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ask-test-{}", std::process::id()));
+        dir.join("config.json")
+    }
 
     #[test]
     fn test_resolve_text_with_value() {
@@ -212,6 +311,65 @@ mod tests {
         }"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.choices[0].message.content, "42");
+    }
+
+    #[test]
+    fn test_save_and_load_config() {
+        let path = temp_config_path();
+        let config = Config {
+            url: Some("http://my-server:9000".into()),
+        };
+        save_config_to(&path, &config).unwrap();
+
+        let loaded = load_config_from(&path);
+        assert_eq!(loaded.url, Some("http://my-server:9000".into()));
+
+        // cleanup
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_load_config_missing_file() {
+        let path = PathBuf::from("/tmp/ask-nonexistent/config.json");
+        let config = load_config_from(&path);
+        assert_eq!(config.url, None);
+    }
+
+    #[test]
+    fn test_load_config_invalid_json() {
+        let path = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "not json").unwrap();
+
+        let config = load_config_from(&path);
+        assert_eq!(config.url, None);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_resolve_url_cli_overrides_config() {
+        let config = Config {
+            url: Some("http://config-server:8000".into()),
+        };
+        let result = resolve_url(Some("http://cli-server:8000".into()), &config);
+        assert_eq!(result, "http://cli-server:8000");
+    }
+
+    #[test]
+    fn test_resolve_url_falls_back_to_config() {
+        let config = Config {
+            url: Some("http://config-server:8000".into()),
+        };
+        let result = resolve_url(None, &config);
+        assert_eq!(result, "http://config-server:8000");
+    }
+
+    #[test]
+    fn test_resolve_url_falls_back_to_default() {
+        let config = Config::default();
+        let result = resolve_url(None, &config);
+        assert_eq!(result, DEFAULT_URL);
     }
 
     #[tokio::test]
